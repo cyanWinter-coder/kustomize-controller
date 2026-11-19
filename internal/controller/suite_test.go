@@ -74,6 +74,10 @@ var (
 	kstatusCheck           *kcheck.Checker
 	kstatusInProgressCheck *kcheck.Checker
 	debugMode              = os.Getenv("DEBUG_TEST") != ""
+	// vaultAvailable reports whether the Vault test instance was started.
+	// It is false when Docker is not available, in which case the
+	// Vault-backed tests are skipped.
+	vaultAvailable bool
 )
 
 func runInContext(registerControllers func(*testenv.Environment), run func() int) (code int) {
@@ -126,14 +130,17 @@ func runInContext(registerControllers func(*testenv.Environment), run func() int
 		panic(fmt.Sprintf("Failed to create k8s client: %v", err))
 	}
 
-	// Create a Vault test instance.
+	// Create a Vault test instance. When Docker is not available, the
+	// Vault-backed tests are skipped instead of failing the whole suite.
 	pool, resource, err := createVaultTestInstance()
 	if err != nil {
-		panic(fmt.Sprintf("Failed to create Vault instance: %v", err))
+		fmt.Printf("Vault test instance unavailable, Vault-backed tests will be skipped: %v\n", err)
+	} else {
+		vaultAvailable = true
+		defer func() {
+			pool.Purge(resource)
+		}()
 	}
-	defer func() {
-		pool.Purge(resource)
-	}()
 
 	code = run()
 

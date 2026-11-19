@@ -92,6 +92,41 @@ func Test_Inventory(t *testing.T) {
 		Merge(nil, nil)
 		Merge(inv1, nil)
 	})
+
+	t.Run("merged survivors surface again on the next diff", func(t *testing.T) {
+		// Simulates two consecutive reconciles after a rejected prune: the
+		// survivor re-merged into the new inventory must show up as stale
+		// again on the next old-vs-new diff, so garbage collection retries
+		// instead of leaking the object as an untracked orphan.
+		stale, err := Diff(inv2, inv1)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(len(stale)).To(BeIdenticalTo(1))
+
+		merged := New()
+		merged.Entries = append(merged.Entries, inv1.Entries...)
+		Merge(merged, stale)
+
+		// Next reconcile: the merged inventory becomes the old state, the
+		// source still doesn't contain the survivor.
+		again, err := Diff(merged, inv1)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(len(again)).To(BeIdenticalTo(1))
+		g.Expect(again[0].GetName()).To(BeIdenticalTo("test2"))
+
+		// The survivor keeps the apiVersion recorded at apply time.
+		g.Expect(again[0].GroupVersionKind().Version).To(BeIdenticalTo(stale[0].GroupVersionKind().Version))
+	})
+
+	t.Run("diff of identical inventories is empty", func(t *testing.T) {
+		// A duplicate reconcile rebuilding the same inventory must not
+		// produce spurious stale objects.
+		dup := New()
+		dup.Entries = append(dup.Entries, inv1.Entries...)
+
+		stale, err := Diff(inv1, dup)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(stale).To(BeEmpty())
+	})
 }
 
 func readManifest(manifest string) (*ssa.ChangeSet, error) {

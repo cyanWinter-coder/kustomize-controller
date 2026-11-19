@@ -106,6 +106,37 @@ reconciled, because:
 
 Manager names are matched exactly, not by prefix.
 
+### Artifact storage and cache cleanup
+
+For each reconciliation, the controller downloads the source artifact into a
+temporary directory named `kustomization-*` under the OS temp dir. The
+directory is removed when the reconciliation ends, whether it succeeded or
+failed (e.g. the artifact download failed or the digest did not match).
+Directories left behind by a process that exited without running its deferred
+cleanup are purged when the controller starts, before the reconcilers begin
+processing objects.
+
+A failed artifact download does not reset the Kustomization status:
+`.status.inventory`, `.status.lastAppliedRevision` and the managed resources
+are preserved, and no garbage collection runs until an apply succeeds. The
+same holds when the source object is deleted — the Kustomization reports
+`Ready=False` with the `ArtifactFailed` reason and keeps its last applied
+state, so reconciliation resumes where it left off once the source or its
+artifact is available again.
+
+Garbage collection of stale resources is driven by the resource inventory
+stored on `.status.inventory`, not by the artifact cache. When a delete is
+rejected by the API server (e.g. by an admission webhook), the surviving
+objects are merged back into the inventory so the next reconciliation retries
+their deletion instead of leaking them as untracked orphans.
+
+When the token cache is enabled (`--token-cache-max-size`), the cloud
+provider tokens used for KMS decryption and kubeconfig retrieval are kept in
+an LRU cache and evicted automatically. The cache event metrics recorded for
+a Kustomization are deleted when the object is finalized, and also when a
+reconcile finds the object already gone, covering objects that were deleted
+before their finalizer ran.
+
 ### Feature Gates
 
 | Name                             | Default Value | Description                                                                                                                                                                                                                                                             |

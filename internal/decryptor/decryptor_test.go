@@ -55,6 +55,24 @@ import (
 	kustomizev1 "github.com/fluxcd/kustomize-controller/api/v1"
 )
 
+func TestDecryptor_CleanupRemovesGnuPGHome(t *testing.T) {
+	g := NewWithT(t)
+
+	d, cleanup, err := New(fake.NewClientBuilder().Build(), &kustomizev1.Kustomization{})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// The decryptor gets a temporary GnuPG home per reconcile, acting as the
+	// key cache for PGP decryptions.
+	home := d.gnuPGHome.String()
+	g.Expect(home).To(BeADirectory())
+
+	// Cleanup removes it so repeated reconciles don't leak keyrings, and is
+	// safe to call more than once.
+	cleanup()
+	g.Expect(home).ToNot(BeADirectory())
+	cleanup()
+}
+
 func TestIsEncryptedSecret(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -30,6 +30,7 @@ import (
 	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	. "github.com/onsi/gomega"
 	"github.com/opencontainers/go-digest"
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -185,6 +186,129 @@ stringData:
 		g.Eventually(func() bool {
 			_ = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(kustomization), resultK)
 			return apimeta.IsStatusConditionTrue(resultK.Status.Conditions, meta.ReadyCondition)
+		}, timeout, time.Second).Should(BeTrue())
+	})
+}
+
+// TestKustomizationReconciler_ArtifactDownloadFailurePreservesState verifies
+// that a failing artifact download does not reset the status: the inventory
+// and the last applied revision are preserved, and the managed resources are
+// not garbage collected while the artifact is unavailable.
+func TestKustomizationReconciler_ArtifactDownloadFailurePreservesState(t *testing.T) {
+	g := NewWithT(t)
+	id := "fetchfail-" + randStringRunes(5)
+	revision := "v1.0.0"
+
+	err := createNamespace(id)
+	g.Expect(err).NotTo(HaveOccurred(), "failed to create test namespace")
+
+	err = createKubeConfigSecret(id)
+	g.Expect(err).NotTo(HaveOccurred(), "failed to create kubeconfig secret")
+
+	manifests := func(name string, data string) []testserver.File {
+		return []testserver.File{
+			{
+				Name: "secret.yaml",
+				Body: fmt.Sprintf(`---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %[1]s
+stringData:
+  key: "%[2]s"
+`, name, data),
+			},
+		}
+	}
+
+	artifact, err := testServer.ArtifactFromFiles(manifests(id, randStringRunes(5)))
+	g.Expect(err).NotTo(HaveOccurred(), "failed to create artifact from files")
+
+	repositoryName := types.NamespacedName{
+		Name:      fmt.Sprintf("fetchfail-%s", randStringRunes(5)),
+		Namespace: id,
+	}
+
+	err = applyGitRepository(repositoryName, artifact, revision)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	kustomizationKey := types.NamespacedName{
+		Name:      fmt.Sprintf("fetchfail-%s", randStringRunes(5)),
+		Namespace: id,
+	}
+	kustomization := &kustomizev1.Kustomization{
+		Name:      kustomizationKey.Name,
+		Namespace: kustomizationKey.Namespace,
+		Spec: kustomizev1.KustomizationSpec{
+			Interval: metav1.Duration{Duration: reconciliationInterval},
+			Path:     "./",
+			KubeConfig: &meta.KubeConfigReference{
+				SecretRef: &meta.SecretKeyReference{
+					Name: "kubeconfig",
+				},
+			},
+			SourceRef: kustomizev1.CrossNamespaceSourceReference{
+				Name:      repositoryName.Name,
+				Namespace: repositoryName.Namespace,
+				Kind:      sourcev1.GitRepositoryKind,
+			},
+			TargetNamespace: id,
+			Prune:           true,
+		},
+	}
+
+	g.Expect(k8sClient.Create(context.Background(), kustomization)).To(Succeed())
+
+	resultK := &kustomizev1.Kustomization{}
+	repo := &sourcev1.GitRepository{
+		Kind:       sourcev1.GitRepositoryKind,
+		APIVersion: sourcev1.GroupVersion.String(),
+	}
+	g.Expect(k8sClient.Get(context.Background(), repositoryName, repo)).Should(Succeed())
+	repoURL := repo.Status.Artifact.URL
+
+	t.Run("reconciles to ready", func(t *testing.T) {
+		g.Eventually(func() bool {
+			_ = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(kustomization), resultK)
+			return isReconcileSuccess(resultK)
+		}, timeout, time.Second).Should(BeTrue())
+	})
+
+	t.Run("download failure preserves status and managed resources", func(t *testing.T) {
+		inventoryEntries := resultK.Status.Inventory.DeepCopy()
+
+		// Break the artifact URL so the download fails with a not found error.
+		g.Expect(k8sClient.Get(context.Background(), repositoryName, repo)).Should(Succeed())
+		repo.Status.Artifact.URL = repoURL + "not-found"
+		repo.ManagedFields = nil
+		g.Expect(k8sClient.Status().Update(context.Background(), repo)).To(Succeed())
+
+		g.Eventually(func() bool {
+			_ = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(kustomization), resultK)
+			ready := apimeta.FindStatusCondition(resultK.Status.Conditions, meta.ReadyCondition)
+			return ready != nil &&
+				ready.Status == metav1.ConditionFalse &&
+				ready.Reason == meta.ArtifactFailedReason
+		}, timeout, time.Second).Should(BeTrue())
+
+		// The last applied revision and the inventory are not reset, and the
+		// managed Secret is not garbage collected while the download fails.
+		g.Expect(resultK.Status.LastAppliedRevision).To(Equal(revision))
+		g.Expect(resultK.Status.Inventory.Entries).To(Equal(inventoryEntries.Entries))
+		g.Consistently(func() error {
+			return k8sClient.Get(context.Background(), types.NamespacedName{Name: id, Namespace: id}, &corev1.Secret{})
+		}, 5*time.Second, time.Second).Should(Succeed())
+	})
+
+	t.Run("recovers after the download failure", func(t *testing.T) {
+		g.Expect(k8sClient.Get(context.Background(), repositoryName, repo)).Should(Succeed())
+		repo.Status.Artifact.URL = repoURL
+		repo.ManagedFields = nil
+		g.Expect(k8sClient.Status().Update(context.Background(), repo)).To(Succeed())
+
+		g.Eventually(func() bool {
+			_ = k8sClient.Get(context.Background(), client.ObjectKeyFromObject(kustomization), resultK)
+			return isReconcileSuccess(resultK)
 		}, timeout, time.Second).Should(BeTrue())
 	})
 }

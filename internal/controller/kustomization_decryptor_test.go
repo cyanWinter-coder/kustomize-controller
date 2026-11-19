@@ -39,6 +39,9 @@ import (
 )
 
 func TestKustomizationReconciler_Decryptor(t *testing.T) {
+	if !vaultAvailable {
+		t.Skip("Vault test instance is not available, Docker is required")
+	}
 	g := NewWithT(t)
 
 	cli, err := api.NewClient(api.DefaultConfig())

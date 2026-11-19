@@ -143,14 +143,20 @@ func (r *KustomizationReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	obj := &kustomizev1.Kustomization{}
 	if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
-		if apierrors.IsNotFound(err) && r.Metrics.MetricsRecorder != nil {
-			// The deferred recording below is not registered when the object is
-			// already gone, so delete any existing duration series for it.
-			r.Metrics.MetricsRecorder.DeleteDuration(corev1.ObjectReference{
-				Kind:      kustomizev1.KustomizationKind,
-				Name:      req.Name,
-				Namespace: req.Namespace,
-			})
+		if apierrors.IsNotFound(err) {
+			if r.Metrics.MetricsRecorder != nil {
+				// The deferred recording below is not registered when the object is
+				// already gone, so delete any existing duration series for it.
+				r.Metrics.MetricsRecorder.DeleteDuration(corev1.ObjectReference{
+					Kind:      kustomizev1.KustomizationKind,
+					Name:      req.Name,
+					Namespace: req.Namespace,
+				})
+			}
+			// The finalizer may never have run (e.g. the object was deleted
+			// before the finalizer was added, or the finalizer was removed
+			// out-of-band), so delete any token cache events recorded for it.
+			r.deleteTokenCacheEvents(req.Name, req.Namespace)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -1351,12 +1357,19 @@ func (r *KustomizationReconciler) finalize(ctx context.Context,
 	controllerutil.RemoveFinalizer(obj, kustomizev1.KustomizationFinalizer)
 
 	// Cleanup caches.
-	for _, op := range kustomizev1.AllMetrics {
-		r.TokenCache.DeleteEventsForObject(kustomizev1.KustomizationKind, obj.GetName(), obj.GetNamespace(), op)
-	}
+	r.deleteTokenCacheEvents(obj.GetName(), obj.GetNamespace())
 
 	// Stop reconciliation as the object is being deleted
 	return ctrl.Result{}, nil
+}
+
+// deleteTokenCacheEvents deletes the token cache events recorded for the
+// given object across all cache operations. It is a no-op when the token
+// cache is disabled.
+func (r *KustomizationReconciler) deleteTokenCacheEvents(name, namespace string) {
+	for _, op := range kustomizev1.AllMetrics {
+		r.TokenCache.DeleteEventsForObject(kustomizev1.KustomizationKind, name, namespace, op)
+	}
 }
 
 func (r *KustomizationReconciler) event(obj *kustomizev1.Kustomization,
